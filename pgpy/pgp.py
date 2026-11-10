@@ -870,6 +870,24 @@ class PGPMessage(Armorable, PGPObject):
     def dash_escape(text):
         return re.subn(r'^-', '- -', text, flags=re.MULTILINE)[0]
 
+    @staticmethod
+    def canonicalize_line_endings(text):
+        # RFC 4880 5.2.4: text document signatures canonicalize line endings
+        # to <CR><LF>, and RFC 4880 6.2 allows an armor frame itself to use
+        # either <LF> or <CR><LF>. The cleartext extracted from armor is
+        # therefore normalized to <LF> here, and the trailing <CR><LF> is
+        # re-derived at hash time in PGPSignature.hashdata.
+        #
+        # The armor regex excludes the line ending that terminates the last
+        # cleartext line from its capture group: for a <CR><LF> frame that
+        # separator's <LF> is consumed and only its <CR> remains, dangling at
+        # the end of the captured text. A bare <CR> is not a legal armor line
+        # ending, so that trailing frame artifact is stripped after normal
+        # <CR><LF> pairs are converted to <LF>. Bare <CR> bytes elsewhere are
+        # left untouched so that genuine content changes still fail verification.
+        text = re.subn(r'\r\n', '\n', text)[0]
+        return re.subn(r'\r$', '', text)[0]
+
     @property
     def encrypters(self):
         """A ``set`` containing all key ids (if any) to which this message was encrypted."""
@@ -1280,7 +1298,8 @@ class PGPMessage(Armorable, PGPObject):
         if unarmored['magic'] == 'SIGNATURE':
             # the composition for this will be the 'cleartext' as a str,
             # followed by one or more signatures (each one loaded into a PGPSignature)
-            self |= self.dash_unescape(unarmored['cleartext'])
+            cleartext = self.canonicalize_line_endings(unarmored['cleartext'])
+            self |= self.dash_unescape(cleartext)
             while len(data) > 0:
                 pkt = Packet(data)
                 if not isinstance(pkt, Signature):  # pragma: no cover
