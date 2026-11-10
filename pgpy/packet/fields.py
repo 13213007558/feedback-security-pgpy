@@ -138,6 +138,16 @@ class SubPackets(collections_abc.MutableMapping, Field):
         for sp in itertools.chain(self._hashed_sp.values(), self._unhashed_sp.values()):
             yield sp
 
+    @property
+    def hashed(self):
+        """All subpackets from the hashed subpacket area, in order."""
+        return list(self._hashed_sp.values())
+
+    @property
+    def unhashed(self):
+        """All subpackets from the unhashed subpacket area, in order."""
+        return list(self._unhashed_sp.values())
+
     def __setitem__(self, key, val):
         # the key provided should always be the classname for the subpacket
         # but, there can be multiple subpackets of the same type

@@ -71,6 +71,8 @@ from .packet.packets import SKESessionKeyV4
 
 from .packet.types import Opaque
 
+from .packet.subpackets.types import Opaque as OpaqueSubPacket
+
 from .types import Armorable
 from .types import Fingerprint
 from .types import ParentRef
@@ -320,6 +322,22 @@ class PGPSignature(Armorable, ParentRef, PGPObject):
         The :py:obj:`~constants.SignatureType` of this signature.
         """
         return self._signature.sigtype
+
+    @property
+    def unknown_critical_subpackets(self):
+        """
+        A ``list`` of the unrecognized (Opaque) subpackets in the hashed subpacket area whose
+        critical bit is set.
+
+        Per RFC 4880 section 5.2.3.1, a critical subpacket in the hashed area of a signature
+        that the implementation does not understand renders the signature invalid. Subpackets
+        in the unhashed area are advisory only and are never considered here, regardless of
+        their critical bit; non-critical subpackets that are not understood are simply ignored.
+        """
+        return [
+            sp for sp in self._signature.subpackets.hashed
+            if isinstance(sp, OpaqueSubPacket) and sp.header.critical
+        ]
 
     @classmethod
     def new(cls, sigtype, pkalg, halg, signer, created=None):
@@ -2487,11 +2505,26 @@ class PGPKey(Armorable, ParentRef, PGPObject):
                 if issues and issues.causes_signature_verify_to_fail:
                     sigv.add_sigsubj(sig, self, subj, issues)
                 else:
+                    # An unrecognized critical subpacket in the hashed area is a constraint the
+                    # signer required us to honor but that we cannot understand: per RFC 4880
+                    # 5.2.3.1, the signature must be considered invalid. Non-critical unknown
+                    # subpackets and anything in the unhashed area do not affect interpretation.
+                    critical_issues = (
+                        SecurityIssues.UnknownCriticalSubpacket
+                        if sig.unknown_critical_subpackets
+                        else SecurityIssues.OK
+                    )
+
+                    # still verify the cryptographic signature, so a broken digest is reported
+                    # as WrongSig rather than being masked by the subpacket issue
                     verified = self._key.verify(sig.hashdata(subj), sig.__sig__, getattr(hashes, sig.hash_algorithm.name)())
                     if verified is NotImplemented:
                         raise NotImplementedError(sig.key_algorithm)
 
-                    sigv.add_sigsubj(sig, self, subj, SecurityIssues.WrongSig if not verified else SecurityIssues.OK)
+                    if not verified:
+                        critical_issues |= SecurityIssues.WrongSig
+
+                    sigv.add_sigsubj(sig, self, subj, critical_issues)
 
         return sigv
 
