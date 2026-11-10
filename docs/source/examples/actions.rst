@@ -67,6 +67,27 @@ Although signing things uses multiple methods, there is only one method to remem
     # or, better yet, verify all applicable signatures on a key in one go
     pub.verify(someones_pubkey)
 
+``verify`` only checks the cryptographic signature itself. For a detached
+document signature made by a subkey, use ``verify_strict`` to additionally
+require that the signing subkey prove it belongs to this primary key: it must
+carry a valid Subkey Binding Signature (0x18) granting it the Sign flag, and a
+Primary Key Binding Signature (0x19) back-signature proving the subkey consents
+to the binding::
+
+    from pgpy.errors import PGPKeyBindingError, PGPSignatureError
+
+    try:
+        signer = pub.verify_strict(document, sig)
+    except PGPSignatureError:
+        # the document signature itself does not verify
+        ...
+    except PGPKeyBindingError:
+        # the signature verifies, but the subkey's binding to the primary key does not
+        ...
+
+The binding relationship can also be checked on its own with
+``pub.verify_subkey_binding(pub.subkeys[keyid])``.
+
 Encryption
 ----------
 

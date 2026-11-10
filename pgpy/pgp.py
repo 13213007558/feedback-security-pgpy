@@ -40,6 +40,8 @@ from .decorators import KeyAction
 
 from .errors import PGPDecryptionError
 from .errors import PGPError
+from .errors import PGPKeyBindingError
+from .errors import PGPSignatureError
 
 from .packet import Key
 from .packet import MDC
@@ -457,12 +459,17 @@ class PGPSignature(Armorable, ParentRef, PGPObject):
             the subkey using the same format as the main key (also using 0x99 as
             the first octet).
             """
-            if subject.is_primary:
-                _s = subject.subkeys[self.signer].hashdata
+            if isinstance(subject, PGPKey) and not subject.is_primary:
+                # the subkey being bound was supplied explicitly
+                subkey = subject
+
+            elif subject.is_primary:
+                subkey = subject.subkeys[self.signer]
 
             else:
-                _s = subject.hashdata
+                subkey = subject
 
+            _s = subkey.hashdata
             _data += b'\x99' + self.int_to_bytes(len(_s), 2) + _s
 
         if self.type in {SignatureType.KeyRevocation, SignatureType.SubkeyRevocation, SignatureType.DirectlyOnKey}:
@@ -550,7 +557,12 @@ class PGPSignature(Armorable, ParentRef, PGPObject):
         """
 
         hcontext = bytearray()
-        hcontext.append(self._signature.header.version if not self.embedded else self._signature._sig.header.version)
+        if self._signature.__class__.__name__ == 'EmbeddedSignature':
+            # an Embedded Signature subpacket (0x20) carries a full Signature
+            # packet inside it; the trailer hashes that inner packet's version
+            hcontext.append(self._signature._sig.header.version)
+        else:
+            hcontext.append(self._signature.header.version)
         hcontext.append(self.type)
         hcontext.append(self.key_algorithm)
         hcontext.append(self.hash_algorithm)
@@ -2494,6 +2506,133 @@ class PGPKey(Armorable, ParentRef, PGPObject):
                     sigv.add_sigsubj(sig, self, subj, SecurityIssues.WrongSig if not verified else SecurityIssues.OK)
 
         return sigv
+
+    @staticmethod
+    def _verify_signature_bytes(key, sig, subject):
+        """Verify the cryptographic signature ``sig`` over ``subject`` using ``key``'s key material directly."""
+        verified = key._key.verify(sig.hashdata(subject), sig.__sig__,
+                                   getattr(hashes, sig.hash_algorithm.name)())
+        if verified is NotImplemented:
+            raise NotImplementedError(sig.key_algorithm)
+        return verified
+
+    def _subkey_binding_signature(self, subkey):
+        """Return the Subkey Binding Signature (0x18) the primary key issued for ``subkey``."""
+        primary_id = self.fingerprint.keyid
+        bindings = [sig for sig in subkey.__sig__
+                    if sig.type == SignatureType.Subkey_Binding and sig.signer == primary_id]
+        if not bindings:
+            return None
+        # the most recent binding is the operative one
+        return max(bindings, key=lambda s: s.created)
+
+    def verify_subkey_binding(self, subkey):
+        """
+        Strictly verify that ``subkey`` is a signing-capable subkey of this primary key.
+
+        Both directions of the binding are checked:
+
+        - the primary key's Subkey Binding Signature (0x18) over the primary key and
+          the subkey must verify, and must grant the subkey the :py:obj:`~constants.KeyFlags.Sign` flag;
+        - the subkey's Primary Key Binding Signature (0x19), carried in the Embedded
+          Signature subpacket of that binding, must verify over the same pair of keys,
+          proving the subkey itself consents to the binding.
+
+        Encryption-only subkeys are out of scope for document signing and raise
+        :py:exc:`~errors.PGPKeyBindingError` without ever being asked for a back-signature.
+
+        :param subkey: the subkey whose binding to this primary key is to be checked
+        :type subkey: :py:obj:`PGPKey`
+        :raises TypeError: if ``subkey`` is not a non-primary :py:obj:`PGPKey`
+        :raises PGPKeyBindingError: if the binding signature, back-signature, or key flags do not hold
+        :returns: the verified :py:obj:`PGPSignature` subkey binding signature
+        """
+        if not isinstance(subkey, PGPKey) or subkey.is_primary:
+            raise TypeError("subkey must be a non-primary PGPKey")
+
+        binding = self._subkey_binding_signature(subkey)
+        if binding is None:
+            raise PGPKeyBindingError(
+                "no Subkey Binding Signature (0x18) from primary key 0x{:s} for subkey 0x{:s}".format(
+                    self.fingerprint.keyid, subkey.fingerprint.keyid))
+
+        if KeyFlags.Sign not in binding.key_flags:
+            raise PGPKeyBindingError(
+                "subkey 0x{:s} is not permitted to sign by its binding signature".format(
+                    subkey.fingerprint.keyid))
+
+        # the primary key must attest to owning this subkey
+        if not self._verify_signature_bytes(self, binding, subkey):
+            raise PGPKeyBindingError(
+                "Subkey Binding Signature (0x18) on subkey 0x{:s} does not verify against primary key 0x{:s}".format(
+                    subkey.fingerprint.keyid, self.fingerprint.keyid))
+
+        embedded = binding._signature.subpackets['EmbeddedSignature']
+        if not embedded:
+            raise PGPKeyBindingError(
+                "signing subkey 0x{:s} has no Primary Key Binding Signature (0x19) back-signature".format(
+                    subkey.fingerprint.keyid))
+
+        backsig = PGPSignature() | next(iter(embedded))
+        if backsig.type != SignatureType.PrimaryKey_Binding:
+            raise PGPKeyBindingError(
+                "embedded signature on subkey 0x{:s} is not a Primary Key Binding Signature (0x19)".format(
+                    subkey.fingerprint.keyid))
+
+        if backsig.signer != subkey.fingerprint.keyid:
+            raise PGPKeyBindingError(
+                "back-signature on subkey 0x{:s} was issued by a different key (0x{:s})".format(
+                    subkey.fingerprint.keyid, backsig.signer))
+
+        # the subkey itself must consent to being bound to this primary key;
+        # pass the subkey as the subject so the correct primary/subkey signed data is used
+        if not self._verify_signature_bytes(subkey, backsig, subkey):
+            raise PGPKeyBindingError(
+                "Primary Key Binding Signature (0x19) from subkey 0x{:s} does not verify against primary key 0x{:s}".format(
+                    subkey.fingerprint.keyid, self.fingerprint.keyid))
+
+        return binding
+
+    def verify_strict(self, subject, signature):
+        """
+        Verify a detached document signature and the signer's binding to this primary key.
+
+        Unlike :py:meth:`verify`, a valid document signature alone is not sufficient: if the
+        signature was made by a subkey, the subkey must prove, via its Subkey Binding
+        Signature (0x18) and Primary Key Binding Signature (0x19) back-signature, that it
+        actually belongs to this primary key and is permitted to sign. Signature failures and
+        key-binding failures are reported as distinct exception types.
+
+        :param subject: The signed document
+        :type subject: ``str``, ``bytes``, ``bytearray``
+        :param signature: The detached document signature
+        :type signature: :py:obj:`PGPSignature`
+        :raises TypeError: if the argument types are unexpected
+        :raises PGPSignatureError: if the document signature does not verify against the purported signing key
+        :raises PGPKeyBindingError: if the signing subkey's binding to this primary key does not hold
+        :returns: the :py:obj:`PGPKey` (primary key or verified subkey) that produced the signature
+        """
+        if not isinstance(subject, (str, bytes, bytearray)):
+            raise TypeError("Unexpected subject value: {:s}".format(str(type(subject))))
+        if not isinstance(signature, PGPSignature):
+            raise TypeError("Unexpected signature value: {:s}".format(str(type(signature))))
+
+        signer_id = signature.signer
+        if signer_id == self.fingerprint.keyid:
+            signer = self
+        elif signer_id in self.subkeys:
+            signer = self.subkeys[signer_id]
+            self.verify_subkey_binding(signer)
+        else:
+            raise PGPKeyBindingError(
+                "signature was made by key 0x{:s}, which is not this primary key or one of its subkeys".format(
+                    signer_id))
+
+        if not self._verify_signature_bytes(signer, signature, subject):
+            raise PGPSignatureError(
+                "document signature from key 0x{:s} does not verify".format(signer_id))
+
+        return signer
 
     @KeyAction(KeyFlags.EncryptCommunications, KeyFlags.EncryptStorage, is_public=True)
     def encrypt(self, message, sessionkey=None, **prefs):

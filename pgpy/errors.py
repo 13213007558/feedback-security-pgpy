@@ -7,12 +7,27 @@ __all__ = ('PGPError',
            'PGPIncompatibleECPointFormatError',
            'PGPOpenSSLCipherNotSupportedError',
            'PGPInsecureCipherError',
+           'PGPSignatureError',
+           'PGPKeyBindingError',
            'WontImplementError',)
 
 
 class PGPError(Exception):
     """Raised as a general error in PGPy"""
     pass
+
+
+class PGPSignatureError(PGPError):
+    """Raised when a document signature does not verify against the purported signing key"""
+    pass
+
+
+class PGPKeyBindingError(PGPError):
+    """Raised when the signing (sub)key cannot prove it is bound to the given primary key"""
+    def __init__(self, *args):
+        super(PGPKeyBindingError, self).__init__(*args)
+        from .constants import SecurityIssues
+        self.security_issue = SecurityIssues.SubkeyBindingNotValid
 
 
 class PGPEncryptionError(Exception):
