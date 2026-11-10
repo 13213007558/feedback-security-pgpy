@@ -4,6 +4,15 @@
 Changelog
 *********
 
+(unreleased)
+============
+
+New Features
+------------
+* added ``PGPKeyring.key_strict``, a strict key selection entry point that fails with
+  ``pgpy.errors.PGPAmbiguousKeyError`` instead of silently picking one of several matching keys,
+  with optional filtering by key half and primary key fingerprint
+
 v0.6.0
 ======
 

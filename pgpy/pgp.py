@@ -38,6 +38,7 @@ from .constants import SecurityIssues
 
 from .decorators import KeyAction
 
+from .errors import PGPAmbiguousKeyError
 from .errors import PGPDecryptionError
 from .errors import PGPError
 
@@ -2835,6 +2836,111 @@ class PGPKeyring(collections_abc.Container, collections_abc.Iterable, collection
             identifier = identifier.signer
 
         yield self._get_key(identifier)
+
+    def _match_keys(self, identifier):
+        """
+        Compute every loaded key matching ``identifier`` directly from ``self._keys``, so the result always
+        reflects the current contents of the keyring rather than any separately maintained (and possibly
+        stale) candidate cache.
+
+        :returns: a ``list`` of ``(pgpkey, basis)`` tuples, where ``basis`` describes why the key matched.
+        """
+        ident = identifier.replace(' ', '').upper() if isinstance(identifier, str) else identifier
+
+        matches = []
+        for pgpkey in self._keys.values():
+            fp = str(pgpkey.fingerprint)
+            if ident == fp:
+                matches.append((pgpkey, 'fingerprint'))
+            elif isinstance(ident, str) and ident == pgpkey.fingerprint.keyid:
+                matches.append((pgpkey, 'key id'))
+            elif isinstance(ident, str) and ident == pgpkey.fingerprint.shortid:
+                matches.append((pgpkey, 'short key id'))
+            elif isinstance(identifier, str):
+                for uid in pgpkey.userids:
+                    basis = next((b for m, b in ((uid.name, 'user id name'),
+                                                 (uid.comment, 'user id comment'),
+                                                 (uid.email, 'user id email'))
+                                  if m and identifier == m), None)
+                    if basis is not None:
+                        matches.append((pgpkey, basis))
+                        break
+
+        return matches
+
+    @contextlib.contextmanager
+    def key_strict(self, identifier, keyhalf='any', primary=None):
+        """
+        A context-manager method, like :py:meth:`PGPKeyring.key`, but strict: it only yields a key if the
+        selection is unambiguous, and raises otherwise. Intended for callers (such as release signing
+        services) that must never silently select the wrong key.
+
+        Unlike :py:meth:`PGPKeyring.key`, non-unique identifiers such as email addresses or short key ids
+        are not considered implicitly unique: if they match more than one distinct key, selection fails.
+
+        The public and private halves of the same key are representations of a single candidate, not two
+        distinct candidates; if both are loaded and ``keyhalf`` does not discriminate between them, the
+        private half is preferred.
+
+        :param identifier: The identifier to use to select a loaded key. Full fingerprints, key ids, short
+                           key ids, and user id components (name, comment, email) are supported.
+        :type identifier: :py:exc:`PGPMessage`, :py:exc:`PGPSignature`, :py:exc:`Fingerprint`, ``str``
+        :param keyhalf: Can be 'any', 'public', or 'private'. If 'public' or 'private', only keys of that
+                        half are considered.
+        :type keyhalf: ``str``
+        :param primary: If specified, the full fingerprint of the primary key the selected key must belong
+                        to. Primary keys must match this fingerprint themselves; subkeys are only eligible
+                        if their parent primary key matches it.
+        :type primary: :py:exc:`Fingerprint`, ``str``, or ``None``
+        :raises: :py:exc:`KeyError` if no loaded key satisfies the identifier and constraints.
+        :raises: :py:exc:`pgpy.errors.PGPAmbiguousKeyError` if more than one distinct key does.
+        """
+        if isinstance(identifier, PGPMessage):
+            for issuer in identifier.issuers:
+                if issuer in self:
+                    identifier = issuer
+                    break
+
+        if isinstance(identifier, PGPSignature):
+            identifier = identifier.signer
+
+        if keyhalf not in {'any', 'public', 'private'}:
+            raise ValueError("keyhalf must be one of: 'any', 'public', 'private'")
+
+        primary_fp = None
+        if primary is not None:
+            primary_fp = str(Fingerprint(str(primary)))
+
+        # group matching keys by fingerprint; the public and private halves of the same key
+        # are a single logical candidate
+        candidates = collections.OrderedDict()
+        for pgpkey, basis in self._match_keys(identifier):
+            if keyhalf == 'public' and not pgpkey.is_public:
+                continue
+            if keyhalf == 'private' and pgpkey.is_public:
+                continue
+
+            if primary_fp is not None:
+                if pgpkey.is_primary:
+                    if str(pgpkey.fingerprint) != primary_fp:
+                        continue
+                else:
+                    # subkeys may only be selected through their parent primary key
+                    if pgpkey.parent is None or str(pgpkey.parent.fingerprint) != primary_fp:
+                        continue
+
+            candidates.setdefault(str(pgpkey.fingerprint), {'basis': basis, 'keys': []})['keys'].append(pgpkey)
+
+        if not candidates:
+            raise KeyError(identifier)
+
+        if len(candidates) > 1:
+            raise PGPAmbiguousKeyError(identifier,
+                                       [(fp, c['basis']) for fp, c in candidates.items()])
+
+        halves = next(iter(candidates.values()))['keys']
+        # prefer the private half when both halves of the selected key are loaded
+        yield next((pgpkey for pgpkey in halves if not pgpkey.is_public), halves[0])
 
     def fingerprints(self, keyhalf='any', keytype='any'):
         """
